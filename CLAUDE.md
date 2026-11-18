@@ -24,23 +24,40 @@ task #490.
   a fix can later be offered upstream on its own.
 - **Tag every merge into `dev`:** `s2m-<upstream version>-<N>`, e.g. `s2m-3.0.22-1`,
   then `s2m-3.0.22-2`. `N` goes up by one at each merge; it restarts at 1 when the
-  upstream base changes. Tag the merge commit on `dev`, annotated, with the PR number
-  and a one-line summary:
+  upstream base changes. Tag the PR's own merge commit, annotated, with the PR number
+  and a one-line summary. Check first that `dev`'s head is that PR's merge commit:
+  someone else may have merged in between, and a tag cannot be fixed afterwards.
   ```bash
+  C=$(gh pr view <PR> --json state,mergeCommit --jq 'select(.state=="MERGED").mergeCommit.oid')
   git switch dev && git pull --ff-only
-  git tag -a s2m-3.0.22-N -m "#PR: summary"
-  git push origin s2m-3.0.22-N
+  git log --oneline s2m-3.0.22-<N-1>..dev   # only this PR's commit, nothing else
+  git tag -a s2m-3.0.22-<N> -m "#<PR>: summary" "$C"
+  git push origin s2m-3.0.22-<N>
   ```
 - **Tags never move and are never deleted.** A till runs a tag; it must always mean the
-  same code.
+  same code. Known slip: `s2m-3.0.22-1` is #1's merge commit, but its message reads "#2:
+  ci…".
 - **Tills install from a tag, never from a branch.**
 - **No rebase, no force-push on `dev` or `master`.** Their history is shared and tagged.
   Rebasing your own change branch before its PR is fine.
 - **Never push to `upstream`.** It is archived; it is only fetched.
 - **Commit messages:** `type(scope): summary`, then a body explaining why, and the Odoo
   task (`Task: #490`). Types: `fix`, `feat`, `test`, `docs`, `chore`, `ci`.
-- Only Speed2Max members merge. Outside contributors may open PRs; a member reviews and
-  merges them.
+
+## Merging into `dev` (GitHub ruleset "dev: PR with Dev team review")
+
+- **Squash merge only.** One commit per PR on `dev`, titled after the PR with `(#N)`;
+  give it the PR's commit message as body.
+- **Required checks:** `pre-commit` and `tests` (workflow `S2M checks`) must pass.
+  Prettier runs in pre-commit and rewraps Markdown at 88 columns: run it before pushing
+  a `.md` change.
+- **Only Speed2Max's Dev team merges.** `CODEOWNERS` makes the Dev team the reviewer of
+  every change. The Dev team may bypass the review, **only when merging a PR**
+  (`gh pr merge <PR> --squash --admin`); a direct push to `dev` is refused to everyone.
+- **Outside contributors** may open PRs. Their CI only runs once a member approves it,
+  and a Dev member reviews and merges them.
+- `master` can only be updated by the Dev team and org owners; `s2m-*` tags can only be
+  created by them and can never be moved or deleted, by anyone.
 
 ## Licence (AGPL-3.0)
 
@@ -57,6 +74,10 @@ git switch -c chore/upstream-vX.Y.Z dev && git merge vX.Y.Z    # then PR into de
 ```
 
 Merge, do not rebase. After that merge, tags restart from `s2m-X.Y.Z-1`.
+
+Squashing that PR would drop upstream's history from `dev` and make the next upstream
+merge conflict. The `dev` ruleset only allows squash: that PR needs merge commits
+allowed for its merge, which is the Dev team's decision at the time.
 
 ## Develop and test
 
