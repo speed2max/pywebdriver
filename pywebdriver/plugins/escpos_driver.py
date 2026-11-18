@@ -5,6 +5,7 @@
 
 import fnmatch
 import logging
+import threading
 from configparser import NoOptionError
 
 import usb.core
@@ -143,6 +144,9 @@ else:
         """ESCPOS Printer Driver class for pywebdriver"""
 
         def __init__(self, *args, **kwargs):
+            # Speed2Max #490: status polls (Flask request threads) and print
+            # jobs (driver thread) share one USB handle; serialise them.
+            self.usb_lock = threading.RLock()
             self.eprint = None
             self.vendor_product = None
             self.open_args = []
@@ -215,22 +219,63 @@ else:
             return connected
 
         def open_printer(self):
-            if self.device:
-                return
-            try:
-                self.open(*self.open_args)
-                if device_type == "win32":
-                    self.device = self.hPrinter
-            except Exception as e:
-                self.set_status("error", e)
+            with self.usb_lock:
+                if self.device:
+                    return
+                try:
+                    self.open(*self.open_args)
+                    if device_type == "win32":
+                        self.device = self.hPrinter
+                except Exception as e:
+                    self.set_status("error", e)
 
-        def open_cashbox(self, printer):
-            self.open_printer()
-            self.cashdraw(2)
-            self.cashdraw(5)
-            self.close()
+        def discard_connection(self):
+            """Forget the current handle after a failure, even a dead one."""
+            try:
+                self.close()
+            except Exception as e:
+                _logger.warning("Closing the failed printer handle: %s", e)
+            finally:
+                self.device = None
+
+        def end_operation(self):
+            """Release the printer after a successful operation.
+
+            Speed2Max #490: python-escpos resets the USB device on every
+            open(), so a USB printer stays open between operations and is
+            only reopened after a failure (see run_locked).
+            """
+            if device_type != "usb":
+                self.close()
+
+        def run_locked(self, operation):
+            """Run operation on the printer under the USB lock.
+
+            On any failure the handle is closed, so the next call reopens
+            the device instead of reusing a dead handle (Speed2Max #490).
+            """
+            with self.usb_lock:
+                self.open_printer()
+                try:
+                    result = operation()
+                except Exception:
+                    self.discard_connection()
+                    raise
+                self.end_operation()
+                return result
+
+        def open_cashbox(self, printer=None):
+            def kick():
+                self.cashdraw(2)
+                self.cashdraw(5)
+
+            self.run_locked(kick)
 
         def get_status(self, **params):
+            with self.usb_lock:
+                return self._get_status()
+
+        def _get_status(self):
             messages = []
             self.open_printer()
             if not self.device:
@@ -250,7 +295,7 @@ else:
                     #         'Error code: %i' % res['printer']['status_error'])
                 except Exception as err:
                     status = "error"
-                    self.device = False
+                    self.discard_connection()
                     messages.append("Error: %s" % err)
             elif device_type == "win32":
                 messages.append(self.printer_name)
@@ -266,7 +311,7 @@ else:
                     status = "connected"
             else:
                 status = "disconnected"
-            self.close()
+            self.end_operation()
             return {
                 "status": status,
                 "messages": messages,
@@ -277,10 +322,11 @@ else:
             self.receipt(content)
 
         def receipt(self, content):
-            self.open_printer()
-            Layout(content).format(self)
-            self.cut()
-            self.close()
+            def print_receipt():
+                Layout(content).format(self)
+                self.cut()
+
+            self.run_locked(print_receipt)
 
         def printstatus(self, eprint):
             addr_lines = []
