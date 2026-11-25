@@ -49,7 +49,9 @@ def load_odoo8(drivers):
     flask.make_response = lambda body: body
     flask.request = types.SimpleNamespace(json={"params": {}})
     sys.modules.update({"pywebdriver": pkg, "flask": flask})
-    spec = importlib.util.spec_from_file_location("pywebdriver.plugins.odoo8", ODOO8_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "pywebdriver.plugins.odoo8", ODOO8_PATH
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
