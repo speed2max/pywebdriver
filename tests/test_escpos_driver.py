@@ -285,6 +285,17 @@ class EscposDriverTest(unittest.TestCase):
         tickets = [w for w in self.driver.written if w.startswith(b"ticket")]
         self.assertEqual(len(tickets), 20)
 
+    def test_status_of_unplugged_printer_is_offline_for_the_pos(self):
+        # The Odoo 19 POS shows "Printer Offline" unless connected/connecting.
+        self.assertEqual(self.driver.get_status()["status"], "connected")
+        FakeUsb.plugged = False
+        self.driver.device.alive = False  # cable pulled under the open handle
+        for _ in range(3):  # the failing poll, then the polls that follow
+            status = self.driver.get_status()["status"]
+            self.assertNotIn(status, ("connected", "connecting"))
+        FakeUsb.plugged = True
+        self.assertEqual(self.driver.get_status()["status"], "connected")
+
     def test_cashbox_opens(self):
         self.driver.open_cashbox(None)
         self.assertIn(b"DRAWER", self.driver.written)

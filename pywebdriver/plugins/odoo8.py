@@ -25,6 +25,10 @@ def status_json():
     params = request.json["params"]
     for driver in drivers:
         statuses[driver] = drivers[driver].get_status(**params)
+    # Speed2Max #490: the Odoo 13+ POS reads the receipt printer as "printer"
+    # (navbar "Printer Offline"), not "escpos". Same status, not asked twice.
+    if "escpos" in statuses and "printer" not in statuses:
+        statuses["printer"] = statuses["escpos"]
     return jsonify(jsonrpc="2.0", result=statuses)
 
 
