@@ -85,16 +85,23 @@ class FakeUsb:
         return object() if idVendor in FakeUsb.present else None
 
 
-def load_cups_driver(usb_vendor_id="04f9"):
+CONSOLE = "http://trakx.local"
+
+
+def load_cups_driver(usb_vendor_id="04f9", cors_origins="*"):
     config = configparser.ConfigParser()
     config.read_string(
-        "[flask]\ncors_origins = *\n[cups_driver]\nusb_vendor_id = %s\n" % usb_vendor_id
+        "[flask]\ncors_origins = %s\n[cups_driver]\nusb_vendor_id = %s\n"
+        % (cors_origins, usb_vendor_id)
     )
 
     class FakeApp:
         logger = logging.getLogger("test_cups_driver")
+        routes = {}  # path -> accepted methods
 
-        def route(self, *a, **k):
+        def route(self, path, methods=None, **k):
+            self.routes[path] = methods
+
             return lambda f: f  # routes stay plain functions of the module
 
     pkg = types.ModuleType("pywebdriver")
@@ -149,15 +156,18 @@ class CupsDriverTest(unittest.TestCase):
         FakeUsb.present = {BROTHER}
         self.module = load_cups_driver()
 
-    def print_data(self, data=None, printer=QUEUE):
+    def print_data(
+        self, data=None, printer=QUEUE, origin=CONSOLE, is_json=True, query=None
+    ):
         """POST /cups/printData as the console does; returns (body, status)."""
         if data is None:
             data = base64.b64encode(PDF).decode()
+        json = {"args": [printer, data, "Result"]} if query is None else {}
         self.module.request = types.SimpleNamespace(
-            json={"args": [printer, data, "Result"]},
-            args={},
-            is_json=True,
-            headers={},
+            json=json if is_json else None,
+            args=query or {},
+            is_json=is_json,
+            headers={"Origin": origin} if origin is not None else {},
         )
         answer = self.module.printersapi()
         return answer if isinstance(answer, tuple) else (answer, 200)
@@ -212,6 +222,50 @@ class CupsDriverTest(unittest.TestCase):
     def test_unexpected_error_is_print_failed(self):
         FakeCups.print_error = RuntimeError("disk full")
         self.assertRefused(self.print_data(), 500, "PrintFailed")
+
+
+class CupsOriginTest(CupsDriverTest):
+    """Only the box's Odoo server may print (Speed2Max #580, no shared token)."""
+
+    def setUp(self):
+        super().setUp()
+        self.module = load_cups_driver(cors_origins=CONSOLE)
+
+    def test_get_is_refused(self):
+        routes = self.module.app.routes
+        self.assertEqual(routes["/cups/printData"], ["POST"])
+        self.assertEqual(routes["/printers/printData"], ["POST"])
+
+    def test_query_string_args_are_ignored(self):
+        data = base64.b64encode(PDF).decode()
+        self.print_data(query={"printer": QUEUE, "data": data})
+        self.assertEqual(FakeCups.jobs, [])
+
+    def test_non_json_body_is_refused(self):
+        self.assertRefused(self.print_data(is_json=False), 415, "JsonRequired")
+
+    def test_other_origin_is_refused(self):
+        answer = self.print_data(origin="http://evil.example")
+        self.assertRefused(answer, 403, "OriginRefused")
+
+    def test_origin_must_match_exactly(self):
+        for origin in ("http://trakx.local:8069", "http://trakx.local/"):
+            with self.subTest(origin=origin):
+                self.assertRefused(self.print_data(origin=origin), 403, "OriginRefused")
+
+    def test_missing_origin_is_refused(self):
+        for origin in (None, "null"):
+            with self.subTest(origin=origin):
+                self.assertRefused(self.print_data(origin=origin), 403, "OriginRefused")
+
+    def test_allowed_origin_prints(self):
+        body, status = self.print_data()
+        self.assertEqual((status, body["result"]), (200, 12))
+
+    def test_star_allows_any_origin(self):
+        self.module = load_cups_driver(cors_origins="*")
+        body, status = self.print_data(origin=None)
+        self.assertEqual((status, body["result"]), (200, 12))
 
 
 if __name__ == "__main__":
