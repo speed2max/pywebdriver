@@ -138,16 +138,36 @@ def cups_error(code, description, status):
     )
 
 
-@app.route("/cups/printData", methods=["POST", "GET", "PUT"])
-@app.route("/printers/printData", methods=["POST", "GET", "PUT"])
+def origin_allowed(origin, allowed):
+    """Whether a request from this Origin may print (Speed2Max #580).
+
+    allowed is [flask] cors_origins: "*" (any origin, upstream's default) or a
+    comma-separated list of exact origins, compared without normalisation.
+    """
+    entries = [entry.strip() for entry in allowed.split(",") if entry.strip()]
+    if "*" in entries:
+        return True
+    return origin is not None and origin in entries
+
+
+# Speed2Max #580: POST only. A GET (or a simple cross-site form POST) needs no
+# CORS pre-check, so any web page could make the console print: the request
+# must be JSON, from the box's Odoo server (no shared token: a local program
+# can still print, which #580 accepts).
+@app.route("/cups/printData", methods=["POST"])
+@app.route("/printers/printData", methods=["POST"])
 def printersapi():
+    if not request.is_json:
+        return cups_error("JsonRequired", "The request must be JSON.", 415)
+    if not origin_allowed(
+        request.headers.get("Origin"), config.get("flask", "cors_origins")
+    ):
+        return cups_error("OriginRefused", "This page may not print here.", 403)
     args = []
     kwargs = {}
     if request.json:
         args = request.json.get("args", [])
         kwargs = request.json.get("kwargs", {})
-    if request.args:
-        kwargs = request.args.to_dict()
     # Speed2Max #580: check everything before CUPS sees a job, and answer an
     # error the caller can show (503 = printer not ready) rather than a job
     # that waits forever or a bare 500.
