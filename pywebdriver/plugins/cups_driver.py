@@ -3,17 +3,27 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl.html).
 
 import base64
+import binascii
+import inspect
 import logging
 import tempfile
 
 import cups
 from flask import jsonify, make_response, request
 
-from pywebdriver import app, drivers
+from pywebdriver import app, config, drivers
 
 from .base_driver import AbstractDriver
 
+try:
+    import usb.core
+except ImportError:  # pragma: no cover - pyusb is in requirements.txt
+    usb = None
+
 _logger = logging.getLogger(__name__)
+
+# Speed2Max #580: CUPS printer-state value of a stopped printer.
+PRINTER_STATE_STOPPED = 5
 
 
 class ExtendedCups(cups.Connection):
@@ -77,6 +87,57 @@ class CupsDriver(AbstractDriver):
         return state
 
 
+def usb_printer_present(vendor_id):
+    """Whether a USB device of this vendor is plugged in (Speed2Max #580)."""
+    return usb is not None and usb.core.find(idVendor=vendor_id) is not None
+
+
+def configured_usb_vendor_id():
+    """[cups_driver] usb_vendor_id as an int, or None when not set."""
+    value = config.get("cups_driver", "usb_vendor_id", fallback="").strip()
+    return int(value, 16) if value else None
+
+
+def queue_problem(conn, printer):
+    """Why this CUPS queue cannot print now, as (code, message), or None.
+
+    Speed2Max #580: CUPS accepts a job on any existing queue and keeps it
+    waiting, even when the USB printer is unplugged (the queue stays idle and
+    accepting). The console must be told instead, so check the queue first.
+    """
+    queue = conn.getPrinters().get(printer)
+    if queue is None:
+        return "PrinterNotFound", "No CUPS queue named %s." % printer
+    if queue.get("printer-state") == PRINTER_STATE_STOPPED:
+        return "PrinterStopped", "The printer %s is stopped." % printer
+    if not queue.get("printer-is-accepting-jobs", True):
+        return "NotAcceptingJobs", "The printer %s does not accept jobs." % printer
+    reasons = queue.get("printer-state-reasons") or []
+    if any(reason.startswith("offline-report") for reason in reasons):
+        return "PrinterOffline", "The printer %s is offline." % printer
+    vendor_id = configured_usb_vendor_id()
+    if (
+        vendor_id is not None
+        and queue.get("device-uri", "").startswith("usb://")
+        and not usb_printer_present(vendor_id)
+    ):
+        return "PrinterOffline", "The USB printer %s is not plugged in." % printer
+    return None
+
+
+def cups_error(code, description, status):
+    return make_response(
+        jsonify(
+            {
+                "cups_error": code,
+                "cups_error_status": code,
+                "cups_error_description": description,
+            }
+        ),
+        status,
+    )
+
+
 @app.route("/cups/printData", methods=["POST", "GET", "PUT"])
 @app.route("/printers/printData", methods=["POST", "GET", "PUT"])
 def printersapi():
@@ -87,8 +148,24 @@ def printersapi():
         kwargs = request.json.get("kwargs", {})
     if request.args:
         kwargs = request.args.to_dict()
-    conn = drivers["cups"].getConnection()
+    # Speed2Max #580: check everything before CUPS sees a job, and answer an
+    # error the caller can show (503 = printer not ready) rather than a job
+    # that waits forever or a bare 500.
     try:
+        call = inspect.signature(ExtendedCups.printData).bind(None, *args, **kwargs)
+    except TypeError as e:
+        return cups_error("BadData", str(e), 400)
+    try:
+        base64.b64decode(call.arguments["data"], validate=True)
+    except (binascii.Error, TypeError, ValueError):
+        return cups_error("BadData", "The data is not valid base64.", 400)
+    conn = drivers["cups"].getConnection()
+    if not conn:
+        return cups_error("CupsUnavailable", "The CUPS server is not running.", 503)
+    try:
+        problem = queue_problem(conn, call.arguments["printer"])
+        if problem:
+            return cups_error(problem[0], problem[1], 503)
         result = conn.printData(*args, **kwargs)
     # TODO we should implement all cups error
     except cups.IPPError as e:
@@ -103,6 +180,9 @@ def printersapi():
             ),
             400,
         )
+    except Exception as e:
+        _logger.exception("Printing on %s failed", call.arguments["printer"])
+        return cups_error("PrintFailed", str(e), 500)
 
     return jsonify(jsonrpc="2.0", result=result)
 
