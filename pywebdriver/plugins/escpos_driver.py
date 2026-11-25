@@ -38,6 +38,19 @@ elif (
 else:
     device_type = "usb"
 
+# Speed2Max #490: how long a POS print request waits for its ticket. A
+# ticket prints in a few seconds; past this, the printer is taken as stalled.
+PRINT_RESULT_TIMEOUT = 15
+
+# Speed2Max #490: the failure answer the Odoo 19 POS understands
+# (BasePrinter.printReceipt): it shows "Printing failed: The printer is not
+# reachable." with a Retry button.
+PRINT_FAILED = {
+    "result": False,
+    "errorCode": "PRINTER_NOT_REACHABLE",
+    "canRetry": True,
+}
+
 SUPPORTED_DEVICES = [
     # Don't add 2 entries with the same vendor and product IDs
     # Epson TM-T70, TM-T70II and Epson TM-P20 have the same vendor/product IDs
@@ -328,6 +341,35 @@ else:
 
             self.run_locked(print_receipt)
 
+        def print_and_wait(self, b64image):
+            """Print a POS ticket and tell whether it came out.
+
+            Speed2Max #490: the POS shows "Printing failed" only when the
+            print request answers a failure, so the request waits for the
+            ticket instead of answering before it is printed. The ticket
+            still goes through the driver queue (one job at a time), and the
+            wait is bounded: a stalled printer gives a failure, not a frozen
+            till.
+            """
+            job = {"done": threading.Event(), "printed": False, "abandoned": False}
+            self.push_task("receipt_job", (b64image, job))
+            if not job["done"].wait(PRINT_RESULT_TIMEOUT):
+                # Not printed in time: the POS reports a failure, so a ticket
+                # still waiting in the queue must not come out later.
+                job["abandoned"] = True
+                _logger.error("Ticket not printed within %ss", PRINT_RESULT_TIMEOUT)
+            return job["printed"]
+
+        def receipt_job(self, data):
+            b64image, job = data
+            try:
+                if job["abandoned"]:
+                    return
+                self.receipt_jpeg(b64image)
+                job["printed"] = True
+            finally:
+                job["done"].set()  # errors are still logged by ThreadDriver.run
+
         def printstatus(self, eprint):
             addr_lines = []
             for ifaceName in interfaces():
@@ -370,7 +412,10 @@ else:
         action = request.json["params"]["data"]["action"]
         if action == "print_receipt":
             receipt = request.json["params"]["data"]["receipt"]
-            driver.push_task("receipt_jpeg", receipt)
+            # Speed2Max #490: answer only once the ticket is printed, and a
+            # failure the POS shows ("The printer is not reachable", Retry).
+            if not driver.print_and_wait(receipt):
+                return jsonify(jsonrpc="2.0", result=PRINT_FAILED)
         if action == "cashbox":
             driver.push_task("open_cashbox")
         return jsonify(jsonrpc="2.0", result=True)

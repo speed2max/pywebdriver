@@ -13,6 +13,7 @@ the driver, for instance the unpatched one, to see the failures they catch.
 import builtins
 import configparser
 import importlib.util
+import logging
 import os
 import sys
 import threading
@@ -20,16 +21,13 @@ import time
 import types
 import unittest
 
-DRIVER_PATH = os.environ.get(
-    "ESCPOS_DRIVER",
-    os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..",
-        "pywebdriver",
-        "plugins",
-        "escpos_driver.py",
-    ),
+PLUGINS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "pywebdriver", "plugins"
 )
+DRIVER_PATH = os.environ.get(
+    "ESCPOS_DRIVER", os.path.join(PLUGINS_DIR, "escpos_driver.py")
+)
+BASE_DRIVER_PATH = os.path.join(PLUGINS_DIR, "base_driver.py")
 
 NO_DEVICE = "[Errno 19] No such device (it may have been disconnected)"
 
@@ -45,6 +43,8 @@ class FakeDevice:
         self.busy = threading.Lock()
 
     def write(self, data):
+        if FakeUsb.hang is not None:  # printer stalled: the write never returns
+            FakeUsb.hang.wait()
         if FakeUsb.unplug_on_next_write:  # cable pulled during this write
             FakeUsb.unplug_on_next_write = False
             FakeUsb.plugged = False
@@ -68,6 +68,7 @@ class FakeUsb:
 
     plugged = True
     unplug_on_next_write = False
+    hang = None  # a threading.Event: writes block until it is set
 
     def __init__(self, idVendor, idProduct, timeout=0, in_ep=0x82, out_ep=0x01, **kw):
         self.resets = 0
@@ -109,25 +110,16 @@ def load_driver():
 
     class FakeApp:
         config = {}
+        logger = logging.getLogger("test_escpos_driver")
 
         def route(self, *a, **k):
-            return lambda f: f
+            return lambda f: f  # routes stay plain functions of the module
 
     pkg = types.ModuleType("pywebdriver")
     pkg.__path__ = []
     pkg.app, pkg.config, pkg.drivers = FakeApp(), config, {}
     plugins = types.ModuleType("pywebdriver.plugins")
     plugins.__path__ = []
-    base = types.ModuleType("pywebdriver.plugins.base_driver")
-
-    class ThreadDriver:
-        def __init__(self, *a, **k):
-            self.status = {"status": "disconnected", "messages": []}
-
-        def set_status(self, status, message=None):
-            self.status = {"status": status, "messages": [message]}
-
-    base.ThreadDriver = ThreadDriver
 
     usb = types.ModuleType("usb")
     usb_core = types.ModuleType("usb.core")
@@ -140,7 +132,8 @@ def load_driver():
     usb.core = usb_core
 
     flask = types.ModuleType("flask")
-    flask.jsonify = flask.render_template = flask.request = None
+    flask.jsonify = lambda **kw: kw  # the JSON-RPC body, as a dict
+    flask.render_template = flask.request = None
     netifaces = types.ModuleType("netifaces")
     netifaces.AF_INET, netifaces.ifaddresses, netifaces.interfaces = 2, None, None
 
@@ -161,7 +154,6 @@ def load_driver():
         {
             "pywebdriver": pkg,
             "pywebdriver.plugins": plugins,
-            "pywebdriver.plugins.base_driver": base,
             "usb": usb,
             "usb.core": usb_core,
             "flask": flask,
@@ -171,20 +163,85 @@ def load_driver():
             "escpos.printer": escpos_printer,
         }
     )
-    spec = importlib.util.spec_from_file_location(
-        "pywebdriver.plugins.escpos_driver", DRIVER_PATH
-    )
-    module = importlib.util.module_from_spec(spec)
+    # The real ThreadDriver: print jobs go through its queue and thread, as on
+    # the till.
+    load_module("pywebdriver.plugins.base_driver", BASE_DRIVER_PATH)
     builtins._ = lambda s: s
+    return load_module("pywebdriver.plugins.escpos_driver", DRIVER_PATH)
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
-    return module.driver
+    return module
+
+
+def receipt_request(receipt="ticket"):
+    """What the Odoo 19 POS posts to /hw_proxy/default_printer_action."""
+    params = {"data": {"action": "print_receipt", "receipt": receipt}}
+    return types.SimpleNamespace(json={"params": params})
+
+
+# What /hw_proxy/default_printer_action must answer when the ticket did not
+# print: the Odoo 19 POS (BasePrinter.printReceipt) then shows "Printing
+# failed: The printer is not reachable." with a Retry button.
+PRINT_FAILED = {
+    "result": False,
+    "errorCode": "PRINTER_NOT_REACHABLE",
+    "canRetry": True,
+}
 
 
 class EscposDriverTest(unittest.TestCase):
     def setUp(self):
         FakeUsb.plugged = True
         FakeUsb.unplug_on_next_write = False
-        self.driver = load_driver()
+        FakeUsb.hang = None
+        self.module = load_driver()
+        self.driver = self.module.driver
+
+    def tearDown(self):
+        if FakeUsb.hang is not None:
+            FakeUsb.hang.set()  # free the driver thread stuck in a write
+
+    def post_receipt(self, receipt="ticket"):
+        self.module.request = receipt_request(receipt)
+        return self.module.default_printer_action()["result"]
+
+    def printed(self, receipt):
+        """Whether a ticket posted by the POS reached the printer."""
+        return any(receipt.encode() in data for data in self.driver.written)
+
+    def test_pos_receipt_printed_reports_success(self):
+        self.assertIs(self.post_receipt("ticket ok"), True)
+        self.assertTrue(self.printed("ticket ok"))
+
+    def test_pos_receipt_printer_unplugged_reports_failure(self):
+        self.driver.get_status()  # printer open, as after the POS's polls
+        FakeUsb.unplug_on_next_write = True
+        self.assertEqual(self.post_receipt(), PRINT_FAILED)
+        # Still unplugged: the reopen fails too, and the POS is told so.
+        self.assertEqual(self.post_receipt(), PRINT_FAILED)
+        FakeUsb.plugged = True  # cable back, the POS's Retry prints
+        self.assertIs(self.post_receipt("retry"), True)
+        self.assertTrue(self.printed("retry"))
+
+    def test_pos_receipt_printer_stalled_reports_failure_in_time(self):
+        self.module.PRINT_RESULT_TIMEOUT = 0.3
+        FakeUsb.hang = threading.Event()
+        start = time.monotonic()
+        self.assertEqual(self.post_receipt(), PRINT_FAILED)
+        self.assertLess(time.monotonic() - start, 2)
+        # A ticket queued behind the stalled one fails as well...
+        self.assertEqual(self.post_receipt("queued"), PRINT_FAILED)
+        FakeUsb.hang.set()  # printer unstuck
+        FakeUsb.hang = None
+        self.assertIs(self.post_receipt("next"), True)
+        # ...and never comes out late: the POS has already reported it lost.
+        self.assertFalse(self.printed("queued"))
+        self.assertTrue(self.printed("next"))
 
     def test_status_polls_do_not_reset_the_printer(self):
         start = self.driver.resets
